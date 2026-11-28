@@ -107,29 +107,32 @@ async def test_router_added_during_first_refresh_polls_immediately(
 
     # Hold the first refresh in the worker while the second router is
     # added, so the addition lands while the first refresh polls.
+    poll_started = threading.Event()
     release = threading.Event()
     connect = ubus[MOCK_HOST].connect
     original_connect = connect.side_effect
 
     def hold_connect() -> str:
+        poll_started.set()
         release.wait()
         return original_connect()
 
     connect.side_effect = hold_connect
 
     setup_task = asyncio.create_task(hass.config_entries.async_setup(entry.entry_id))
-    while connect.call_count < 1:
-        await asyncio.sleep(0)
-    hass.config_entries.async_add_subentry(
-        entry,
-        ConfigSubentry(
-            data=MappingProxyType(MOCK_HOST_CONFIG_B),
-            subentry_type=SUBENTRY_TYPE_ROUTER,
-            title=MOCK_HOST_B,
-            unique_id=MOCK_HOST_B,
-        ),
-    )
-    release.set()
+    assert await hass.async_add_executor_job(poll_started.wait, 10)
+    try:
+        hass.config_entries.async_add_subentry(
+            entry,
+            ConfigSubentry(
+                data=MappingProxyType(MOCK_HOST_CONFIG_B),
+                subentry_type=SUBENTRY_TYPE_ROUTER,
+                title=MOCK_HOST_B,
+                unique_id=MOCK_HOST_B,
+            ),
+        )
+    finally:
+        release.set()
     assert await setup_task
     await hass.async_block_till_done()
 
@@ -666,13 +669,16 @@ async def test_credentials_change_during_tick_keeps_sightings(
     async_fire_time_changed(hass)
     assert await hass.async_add_executor_job(poll_started.wait, 10)
 
-    # The password changes on the same host while the tick is in flight.
-    subentry = next(iter(mock_config_entry.subentries.values()))
-    data = dict(subentry.data)
-    data[CONF_PASSWORD] = "new-password"
-    hass.config_entries.async_update_subentry(mock_config_entry, subentry, data=data)
-
-    poll_release.set()
+    try:
+        # The password changes on the same host while the tick is in flight.
+        subentry = next(iter(mock_config_entry.subentries.values()))
+        data = dict(subentry.data)
+        data[CONF_PASSWORD] = "new-password"
+        hass.config_entries.async_update_subentry(
+            mock_config_entry, subentry, data=data
+        )
+    finally:
+        poll_release.set()
     await hass.async_block_till_done(wait_background_tasks=True)
 
     # The in-flight result was for the old configuration, so the tick drops
@@ -763,8 +769,10 @@ async def test_slow_router_does_not_stretch_refresh_interval(
     freezer.tick(timedelta(seconds=30))
     async_fire_time_changed(hass)
     assert await hass.async_add_executor_job(poll_started.wait, 10)
-    freezer.tick(timedelta(seconds=20))
-    poll_release.set()
+    try:
+        freezer.tick(timedelta(seconds=20))
+    finally:
+        poll_release.set()
     await hass.async_block_till_done(wait_background_tasks=True)
     assert ubus[MOCK_HOST_B].get_hostapd_clients.call_count == 2
 
@@ -823,17 +831,19 @@ async def test_router_addition_refreshes_while_tick_in_flight(
     async_fire_time_changed(hass)
     assert await hass.async_add_executor_job(poll_started.wait, 10)
 
-    # A router is added while the tick is in flight.
-    hass.config_entries.async_add_subentry(
-        mock_config_entry,
-        ConfigSubentry(
-            data=MappingProxyType(MOCK_HOST_CONFIG_B),
-            subentry_type=SUBENTRY_TYPE_ROUTER,
-            title=MOCK_HOST_B,
-            unique_id=MOCK_HOST_B,
-        ),
-    )
-    poll_release.set()
+    try:
+        # A router is added while the tick is in flight.
+        hass.config_entries.async_add_subentry(
+            mock_config_entry,
+            ConfigSubentry(
+                data=MappingProxyType(MOCK_HOST_CONFIG_B),
+                subentry_type=SUBENTRY_TYPE_ROUTER,
+                title=MOCK_HOST_B,
+                unique_id=MOCK_HOST_B,
+            ),
+        )
+    finally:
+        poll_release.set()
     await hass.async_block_till_done(wait_background_tasks=True)
 
     # The new router was polled right after the tick, without the clock
