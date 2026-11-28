@@ -62,10 +62,11 @@ async def _async_entry_updated(hass: HomeAssistant, entry: UbusConfigEntry) -> N
 
 async def async_setup_entry(hass: HomeAssistant, entry: UbusConfigEntry) -> None:
     """Set up the OpenWrt (ubus) hub from a config entry."""
-    # The startup consolidation may have run before a hub existed: a
-    # YAML import creates one with every entry disabled, so this entry
-    # would become a second poller unless it merges into the hub now.
-    # Only a hub holding routers is a target; an empty shell left by a
+    # The startup consolidation may have run before a hub existed: it
+    # skips installs without an enabled entry, so the first hub,
+    # created later by a YAML import or a re-enabled entry, must merge
+    # into the existing hub instead of becoming a second poller. A hub
+    # holding routers is the only target; an empty shell left by a
     # failed migration is meant to be deleted. A hub mid-transition is
     # waited on through its setup lock, held for the whole transition,
     # so a racing setup never starts a second coordinator: a hub being
@@ -114,6 +115,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: UbusConfigEntry) -> None
         merged = await _async_migrate_other(hass, hub, entry, holding_setup_lock=True)
         if merged:
             return
+    else:
+        # This entry is the first hub: the startup consolidation
+        # requires an enabled entry, so disabled entries it skipped
+        # still hold tracker ids which keep this hub from reporting
+        # shared clients; merge them into it before its platform
+        # claims ids.
+        for other in sorted(
+            (
+                candidate
+                for candidate in hass.config_entries.async_entries(DOMAIN)
+                if (
+                    candidate is not entry
+                    and candidate.version <= UbusConfigFlow.VERSION
+                    and candidate.disabled_by is not None
+                )
+            ),
+            key=lambda candidate: candidate.entry_id,
+        ):
+            await _async_migrate_other(hass, entry, other)
     coordinator = UbusDataUpdateCoordinator(hass, entry)
     # A coordinator only polls while it has a listener; the entity updates
     # are driven by the presence signal, not by it.

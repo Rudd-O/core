@@ -3245,17 +3245,19 @@ async def test_migration_merges_entries_into_hub(
 
 
 @pytest.mark.usefixtures("entity_registry_enabled_by_default")
-async def test_reenabled_entry_merges_into_late_hub(
+async def test_late_hub_consolidates_disabled_entries(
     hass: HomeAssistant,
     mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
+    device_registry: dr.DeviceRegistry,
     entity_registry: er.EntityRegistry,
+    issue_registry: ir.IssueRegistry,
 ) -> None:
-    """Test an entry re-enabled after a YAML import merges into the hub.
+    """Test a hub created by a YAML import after startup merges disabled entries.
 
     With every entry disabled the startup consolidation has no hub to
-    consolidate into, so the YAML import creates one; re-enabling an old
-    entry must merge it into that hub instead of becoming a second
-    poller, as it would be until the next restart.
+    consolidate into, so a YAML import creates one; disabled entries
+    which still hold tracker ids must merge into it, or the old ids
+    keep the hub from reporting shared clients.
     """
     _mock, ubus = mock_ubus_by_host
     legacy_a = MockConfigEntry(
@@ -3274,7 +3276,21 @@ async def test_reenabled_entry_merges_into_late_hub(
     )
     legacy_b.disabled_by = ConfigEntryDisabler.USER
     legacy_b.add_to_hass(hass)
-    ubus[MOCK_HOST].get_hostapd_clients.return_value = {
+
+    # The entry tracked the client before it was disabled, so its
+    # tracker and device ids remain in the registries.
+    device = device_registry.async_get_or_create(
+        config_entry_id=legacy_b.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, MAC_PHONE)},
+    )
+    tracker = entity_registry.async_get_or_create(
+        DEVICE_TRACKER_DOMAIN,
+        DOMAIN,
+        MAC_PHONE,
+        config_entry=legacy_b,
+        device_id=device.id,
+    )
+    ubus[MOCK_HOST_B].get_hostapd_clients.return_value = {
         "clients": {MAC_PHONE: {"authorized": True}}
     }
 
@@ -3296,42 +3312,36 @@ async def test_reenabled_entry_merges_into_late_hub(
     )
     await hass.async_block_till_done()
 
-    # Host C's client appears on the hub's next poll, which the
-    # re-enabled entry's transferred subentry triggers.
-    ubus[MOCK_HOST_C].get_hostapd_clients.return_value = {
-        "clients": {MAC_LAPTOP: {"authorized": True}}
-    }
-
+    # The disabled entries merged into the hub, with a warning per
+    # transferred router; the hub polls all three routers.
     entries = hass.config_entries.async_entries(DOMAIN)
-    assert len(entries) == 3
-    hub = next(entry for entry in entries if entry.source == SOURCE_IMPORT)
+    assert len(entries) == 1
+    hub = entries[0]
+    assert hub.source == SOURCE_IMPORT
     assert hub.state is ConfigEntryState.LOADED
-    assert {subentry.unique_id for subentry in hub.subentries.values()} == {MOCK_HOST_C}
-    assert legacy_a.disabled_by is ConfigEntryDisabler.USER
-    assert legacy_b.disabled_by is ConfigEntryDisabler.USER
-
-    # Re-enabling the old entry merges it into the hub instead of
-    # leaving a second poller behind.
-    await hass.config_entries.async_set_disabled_by(legacy_a.entry_id, None)
-    await hass.async_block_till_done()
-
-    entries = hass.config_entries.async_entries(DOMAIN)
-    assert [entry.entry_id for entry in entries] == [
-        legacy_b.entry_id,
-        hub.entry_id,
-    ]
     assert {subentry.unique_id for subentry in hub.subentries.values()} == {
         MOCK_HOST,
+        MOCK_HOST_B,
         MOCK_HOST_C,
     }
-    # Both routers are polled on the hub; each client has exactly one
-    # tracker, registered on the hub.
-    for mac in (MAC_PHONE, MAC_LAPTOP):
-        entity_id = entity_registry.async_get_entity_id(
-            DEVICE_TRACKER_DOMAIN, DOMAIN, mac
+    for host in (MOCK_HOST, MOCK_HOST_B):
+        subentry = next(
+            subentry
+            for subentry in hub.subentries.values()
+            if subentry.unique_id == host
         )
-        assert entity_registry.async_get(entity_id).config_entry_id == hub.entry_id
-        assert hass.states.get(entity_id).state == STATE_HOME
+        issue = issue_registry.async_get_issue(
+            DOMAIN, f"migration_disabled_entry_{subentry.subentry_id}"
+        )
+        assert issue is not None
+        assert issue.translation_key == "migration_disabled_entry"
+        assert issue.translation_placeholders == {"host": host}
+
+    # The old tracker id now belongs to the hub, so the hub reports
+    # the shared client through it.
+    assert entity_registry.async_get(tracker.entity_id).config_entry_id == hub.entry_id
+    assert device_registry.async_get(device.id).config_entry_id == hub.entry_id
+    assert hass.states.get(tracker.entity_id).state == STATE_HOME
 
 
 @pytest.mark.usefixtures("entity_registry_enabled_by_default")

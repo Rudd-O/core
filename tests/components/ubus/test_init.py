@@ -96,9 +96,9 @@ async def test_reenabled_entry_racing_hub_reload_merges_into_hub(
     """Test an entry re-enabled during a hub reload merges into the hub.
 
     The startup consolidation may have run before a hub existed, so a
-    re-enabled entry set up while the hub reloads must wait for the
-    hub instead of starting its own coordinator, or the two entries
-    would track separate presence views.
+    late entry set up while the hub reloads must wait for the hub
+    instead of starting its own coordinator, or the two entries would
+    track separate presence views.
     """
     _mock, _ubus = mock_ubus_by_host
     hub = MockConfigEntry(
@@ -110,6 +110,16 @@ async def test_reenabled_entry_racing_hub_reload_merges_into_hub(
         subentries_data=[router_subentry_data(MOCK_CONFIG)],
     )
     hub.add_to_hass(hass)
+    # The component is set up before the hub, so the startup
+    # consolidation consolidates nothing.
+    assert await async_setup_component(hass, DOMAIN, {})
+    assert await hass.config_entries.async_set_disabled_by(hub.entry_id, None)
+    await hass.async_block_till_done()
+    assert hub.state is ConfigEntryState.LOADED
+
+    # The legacy entry appears only after the hub is set up: a disabled
+    # entry added before would have been consolidated into the hub on
+    # its first setup.
     legacy = MockConfigEntry(
         domain=DOMAIN,
         data=MOCK_HOST_CONFIG_B,
@@ -118,12 +128,6 @@ async def test_reenabled_entry_racing_hub_reload_merges_into_hub(
         disabled_by=ConfigEntryDisabler.USER,
     )
     legacy.add_to_hass(hass)
-    # The component is set up before either entry, so the startup
-    # consolidation consolidates nothing.
-    assert await async_setup_component(hass, DOMAIN, {})
-    assert await hass.config_entries.async_set_disabled_by(hub.entry_id, None)
-    await hass.async_block_till_done()
-    assert hub.state is ConfigEntryState.LOADED
 
     # Hold the reload open between the hub's unload and its setup: the
     # side effect gates the hub's unload and then falls through to the
