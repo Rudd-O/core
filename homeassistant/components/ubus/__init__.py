@@ -138,11 +138,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: UbusConfigEntry) -> None
     # A coordinator only polls while it has a listener; the entity updates
     # are driven by the presence signal, not by it.
     entry.async_on_unload(coordinator.async_add_listener(_async_keep_polling))
+    # The update listener must be registered before the first refresh:
+    # a router added while the first refresh polls would otherwise wait
+    # a full interval for the periodic tick.
+    entry.runtime_data = coordinator
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
     # A router whose first poll fails does not fail entry setup: it is
     # marked unhealthy and polling continues until it recovers.
     await coordinator.async_refresh()
-    entry.runtime_data = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     issue_registry = ir.async_get(hass)

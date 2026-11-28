@@ -89,6 +89,54 @@ async def test_setup_entry_without_subentries(
     assert ubus[MOCK_HOST_B].get_hostapd_clients.call_count == 0
 
 
+async def test_router_added_during_first_refresh_polls_immediately(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
+) -> None:
+    """Test a router added while the first refresh polls is polled right away.
+
+    The update listener is registered before the first refresh, so a
+    router imported while the hub's first refresh polls the other
+    routers triggers an immediate refresh instead of waiting a full
+    interval for the periodic tick.
+    """
+    _mock, ubus = mock_ubus_by_host
+    entry = mock_config_entry
+    entry.add_to_hass(hass)
+
+    # Hold the first refresh in the worker while the second router is
+    # added, so the addition lands while the first refresh polls.
+    release = threading.Event()
+    connect = ubus[MOCK_HOST].connect
+    original_connect = connect.side_effect
+
+    def hold_connect() -> str:
+        release.wait()
+        return original_connect()
+
+    connect.side_effect = hold_connect
+
+    setup_task = asyncio.create_task(hass.config_entries.async_setup(entry.entry_id))
+    while connect.call_count < 1:
+        await asyncio.sleep(0)
+    hass.config_entries.async_add_subentry(
+        entry,
+        ConfigSubentry(
+            data=MappingProxyType(MOCK_HOST_CONFIG_B),
+            subentry_type=SUBENTRY_TYPE_ROUTER,
+            title=MOCK_HOST_B,
+            unique_id=MOCK_HOST_B,
+        ),
+    )
+    release.set()
+    assert await setup_task
+    await hass.async_block_till_done()
+
+    # The added router was polled right away, not on the next tick.
+    assert ubus[MOCK_HOST_B].connect.call_count >= 1
+
+
 async def test_reenabled_entry_racing_hub_reload_merges_into_hub(
     hass: HomeAssistant,
     mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
