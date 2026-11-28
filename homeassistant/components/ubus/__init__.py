@@ -1,7 +1,6 @@
 """The OpenWrt (ubus) integration."""
 
-# pylint: disable=home-assistant-use-runtime-data  # The merge map is cross-entry state; entry.runtime_data is per-entry and is cleared by the hub reload a merge runs
-import asyncio
+# pylint: disable=home-assistant-use-runtime-data  # The merging set is cross-entry state; entry.runtime_data is per-entry and is cleared by the hub reload a merge runs
 import logging
 from types import MappingProxyType
 
@@ -63,47 +62,56 @@ async def _async_entry_updated(hass: HomeAssistant, entry: UbusConfigEntry) -> N
 
 async def async_setup_entry(hass: HomeAssistant, entry: UbusConfigEntry) -> None:
     """Set up the OpenWrt (ubus) hub from a config entry."""
-    # The startup consolidation may have run before a hub existed: a YAML
-    # import creates one with every entry disabled, so this entry would
-    # become a second poller unless it merges into the hub now. Only a
-    # loaded hub holding routers is a target: one being set up or removed
-    # may not stay and could merge in turn, and an empty shell left by a
-    # failed migration is meant to be deleted. A merge into the hub reloads
-    # it, so the hub is not loaded while the merge runs; a setup racing it
-    # waits for the merge, or it would start a poller of its own.
-    merging: dict[str, asyncio.Event] = hass.data.setdefault(DOMAIN, {})
+    # The startup consolidation may have run before a hub existed: a
+    # YAML import creates one with every entry disabled, so this entry
+    # would become a second poller unless it merges into the hub now.
+    # Only a hub holding routers is a target; an empty shell left by a
+    # failed migration is meant to be deleted. A hub mid-transition is
+    # waited on through its setup lock, held for the whole transition,
+    # so a racing setup never starts a second coordinator: a hub being
+    # merged into is marked merging, and one being unloaded is mid
+    # transition either way. An entry set up at the same time is never
+    # waited on: it merges into the hub, not the other way around, and
+    # waiting on it could deadlock a merge whose hub reload races it.
+    merging: set[str] = hass.data.setdefault(DOMAIN, set())
     while True:
-        hub = next(
-            (
-                candidate
-                for candidate in hass.config_entries.async_entries(DOMAIN)
-                if (
-                    candidate is not entry
-                    and (
-                        candidate.state is ConfigEntryState.LOADED
-                        or candidate.entry_id in merging
+        hub = None
+        definite = None
+        for candidate in hass.config_entries.async_entries(DOMAIN):
+            if (
+                candidate is entry
+                or candidate.disabled_by is not None
+                or candidate.version > UbusConfigFlow.VERSION
+                or candidate.data
+                or not candidate.subentries
+                or (
+                    candidate.state
+                    not in (
+                        ConfigEntryState.LOADED,
+                        ConfigEntryState.SETUP_IN_PROGRESS,
+                        ConfigEntryState.UNLOAD_IN_PROGRESS,
                     )
-                    and candidate.disabled_by is None
-                    and candidate.version <= UbusConfigFlow.VERSION
-                    and not candidate.data
-                    and candidate.subentries
+                    and candidate.entry_id not in merging
                 )
-            ),
-            None,
-        )
-        if hub is None or hub.entry_id not in merging:
-            if hub is not None:
-                merging[hub.entry_id] = asyncio.Event()
+            ):
+                continue
+            if candidate.state is ConfigEntryState.LOADED:
+                if hub is None or candidate.entry_id < hub.entry_id:
+                    hub = candidate
+            elif (
+                candidate.entry_id in merging
+                or candidate.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+            ):
+                if definite is None or candidate.entry_id < definite.entry_id:
+                    definite = candidate
+        if hub is not None:
             break
-        await merging[hub.entry_id].wait()
+        if definite is None:
+            break
+        async with definite.setup_lock:
+            pass
     if hub is not None:
-        try:
-            merged = await _async_migrate_other(
-                hass, hub, entry, holding_setup_lock=True
-            )
-        finally:
-            merging[hub.entry_id].set()
-            del merging[hub.entry_id]
+        merged = await _async_migrate_other(hass, hub, entry, holding_setup_lock=True)
         if merged:
             return
     coordinator = UbusDataUpdateCoordinator(hass, entry)
@@ -353,9 +361,17 @@ async def _async_migrate_other(
             # the merge moved this entry's over; reload it so the
             # merged ids are normalized too, not left as duplicates.
             # async_reload returns False instead of raising on a
-            # failed unload or setup.
-            if not await hass.config_entries.async_reload(hub.entry_id):
-                _async_create_hub_reload_failed_issue(hass, hub, entry, host)
+            # failed unload or setup. The reload takes the hub off
+            # the loaded state, so it is marked merging: a setup
+            # racing it waits on the hub's setup lock, held for the
+            # whole reload.
+            merging: set[str] = hass.data.setdefault(DOMAIN, set())
+            merging.add(hub.entry_id)
+            try:
+                if not await hass.config_entries.async_reload(hub.entry_id):
+                    _async_create_hub_reload_failed_issue(hass, hub, entry, host)
+            finally:
+                merging.discard(hub.entry_id)
             # The removal needs the setup lock, which is held for the
             # rest of the setup, so it runs in a deferred task.
             hass.async_create_task(_async_deferred_removal(hass, hub, entry, host))

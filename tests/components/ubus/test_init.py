@@ -1,11 +1,12 @@
 """Tests for the OpenWrt (ubus) integration setup."""
 
+import asyncio
 from datetime import timedelta
 import logging
 import threading
 from types import MappingProxyType
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 from freezegun.api import FrozenDateTimeFactory
 import pytest
@@ -14,11 +15,13 @@ from pytest_homeassistant.typing import WebSocketGenerator
 
 from homeassistant.components.device_tracker import DOMAIN as DEVICE_TRACKER_DOMAIN
 from homeassistant.components.device_tracker.const import DEFAULT_CONSIDER_HOME
+from homeassistant.components.ubus import async_unload_entry
 from homeassistant.components.ubus.config_flow import HUB_TITLE
 from homeassistant.components.ubus.const import DOMAIN, SUBENTRY_TYPE_ROUTER
 from homeassistant.components.ubus.coordinator import REQUEST_TIMEOUT
 from homeassistant.components.ubus.device_tracker import UbusScannerEntity
 from homeassistant.config_entries import (
+    ConfigEntry,
     ConfigEntryDisabler,
     ConfigEntryState,
     ConfigSubentry,
@@ -84,6 +87,81 @@ async def test_setup_entry_without_subentries(
     assert entry.state is ConfigEntryState.LOADED
     assert ubus[MOCK_HOST].get_hostapd_clients.call_count == 0
     assert ubus[MOCK_HOST_B].get_hostapd_clients.call_count == 0
+
+
+async def test_reenabled_entry_racing_hub_reload_merges_into_hub(
+    hass: HomeAssistant,
+    mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
+) -> None:
+    """Test an entry re-enabled during a hub reload merges into the hub.
+
+    The startup consolidation may have run before a hub existed, so a
+    re-enabled entry set up while the hub reloads must wait for the
+    hub instead of starting its own coordinator, or the two entries
+    would track separate presence views.
+    """
+    _mock, _ubus = mock_ubus_by_host
+    hub = MockConfigEntry(
+        domain=DOMAIN,
+        data={},
+        title=HUB_TITLE,
+        entry_id="00000000000000000000000000A",
+        disabled_by=ConfigEntryDisabler.USER,
+        subentries_data=[router_subentry_data(MOCK_CONFIG)],
+    )
+    hub.add_to_hass(hass)
+    legacy = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_HOST_CONFIG_B,
+        title=MOCK_HOST_B,
+        entry_id="00000000000000000000000000B",
+        disabled_by=ConfigEntryDisabler.USER,
+    )
+    legacy.add_to_hass(hass)
+    # The component is set up before either entry, so the startup
+    # consolidation consolidates nothing.
+    assert await async_setup_component(hass, DOMAIN, {})
+    assert await hass.config_entries.async_set_disabled_by(hub.entry_id, None)
+    await hass.async_block_till_done()
+    assert hub.state is ConfigEntryState.LOADED
+
+    # Hold the reload open between the hub's unload and its setup: the
+    # side effect gates the hub's unload and then falls through to the
+    # real one, so the platforms are actually unloaded when it releases.
+    unloaded = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def hold_unload(hass: HomeAssistant, entry: ConfigEntry) -> Any:
+        unloaded.set()
+        await proceed.wait()
+        return DEFAULT
+
+    with patch(
+        "homeassistant.components.ubus.async_unload_entry",
+        AsyncMock(wraps=async_unload_entry, side_effect=hold_unload),
+    ):
+        reload_task = asyncio.create_task(
+            hass.config_entries.async_reload(hub.entry_id)
+        )
+        await unloaded.wait()
+        setup_task = asyncio.create_task(
+            hass.config_entries.async_set_disabled_by(legacy.entry_id, None)
+        )
+        proceed.set()
+        await asyncio.gather(reload_task, setup_task)
+    await hass.async_block_till_done()
+
+    # The legacy entry merged into the hub instead of keeping its own
+    # coordinator: the hub is loaded, holds both routers, and the
+    # legacy entry is gone.
+    assert hub.state is ConfigEntryState.LOADED
+    assert [entry.entry_id for entry in hass.config_entries.async_entries(DOMAIN)] == [
+        hub.entry_id
+    ]
+    assert {subentry.title for subentry in hub.subentries.values()} == {
+        MOCK_HOST,
+        MOCK_HOST_B,
+    }
 
 
 @pytest.mark.parametrize(
