@@ -32,7 +32,6 @@ from homeassistant.config_entries import (
     ConfigEntryError,
     ConfigEntryState,
     ConfigSubentry,
-    OperationNotAllowed,
     UnknownEntry,
 )
 from homeassistant.const import (
@@ -4178,12 +4177,18 @@ async def test_migration_idempotent_on_second_setup(
     }
 
 
-async def test_migration_failure_after_transfer_empties_leftover_entry(
+async def test_migration_removal_of_removed_entry_is_silent(
     hass: HomeAssistant,
     mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
     issue_registry: ir.IssueRegistry,
 ) -> None:
-    """Test a failed removal after the transfer leaves a shell entry."""
+    """Test removing an already-removed entry leaves a shell, no repair.
+
+    The user may delete the merged entry while the migration removes it;
+    the removal then fails with an expected UnknownEntry. The entry was
+    emptied before removal, so the leftover is a shell which cannot poll
+    the router again, and there is nothing left to repair.
+    """
     _mock, ubus = mock_ubus_by_host
     hub_entry = MockConfigEntry(
         domain=DOMAIN,
@@ -4199,51 +4204,34 @@ async def test_migration_failure_after_transfer_empties_leftover_entry(
     )
     legacy_entry.add_to_hass(hass)
     hub_entry.add_to_hass(hass)
-    # An expected core failure, not a bug: it gets a repair, and the
-    # hub still loads.
     with patch(
         "homeassistant.config_entries.ConfigEntries.async_remove",
-        side_effect=OperationNotAllowed("simulated expected core failure"),
+        side_effect=UnknownEntry("simulated concurrent removal"),
     ):
         assert await hass.config_entries.async_setup(hub_entry.entry_id)
     await hass.async_block_till_done()
 
     assert hub_entry.state is ConfigEntryState.LOADED
-    # The transfer completed: the hub owns the router subentry. The
-    # leftover entry was emptied before the failed removal, so it is a
-    # shell which cannot poll the router again.
+    # The transfer completed before the removal ran, so the hub owns the
+    # router; the leftover was emptied, so it is a shell which cannot
+    # poll the router again.
     assert MOCK_HOST_B in {sub.unique_id for sub in hub_entry.subentries.values()}
     assert legacy_entry.state is ConfigEntryState.LOADED
-    assert legacy_entry.disabled_by is None
     assert legacy_entry.version == 2
     assert legacy_entry.data == {}
     assert legacy_entry.subentries == {}
-    # The hub is the only poller: setting up the shell added no second
-    # poll of the router.
     assert ubus[MOCK_HOST_B].get_hostapd_clients.call_count == 1
-    issue = issue_registry.async_get_issue(
-        DOMAIN, f"migration_removal_failed_{legacy_entry.entry_id}"
-    )
-    assert issue is not None
-    assert issue.translation_key == "migration_removal_failed"
-    assert issue.translation_placeholders == {"host": MOCK_HOST_B}
-    assert issue.config_entry_id == legacy_entry.entry_id
-    # The leftover is empty, so the repair can ask for its deletion, in
-    # separate numbered steps.
-    translations = await async_get_translations(hass, "en", "issues", {DOMAIN})
-    description = translations[
-        f"component.{DOMAIN}.issues.migration_removal_failed.description"
-    ]
-    assert "delete" in description.lower()
-    assert "\n\n1. " in description
-    assert "\n2. " in description
-
-    # Deleting the shell finishes the migration and clears its repair.
-    assert await hass.config_entries.async_remove(legacy_entry.entry_id)
-    await hass.async_block_till_done()
+    # The entry was already gone when the removal ran, so nothing is left
+    # to repair.
     assert (
         issue_registry.async_get_issue(
             DOMAIN, f"migration_removal_failed_{legacy_entry.entry_id}"
+        )
+        is None
+    )
+    assert (
+        issue_registry.async_get_issue(
+            DOMAIN, f"migration_failed_{legacy_entry.entry_id}"
         )
         is None
     )
@@ -4279,10 +4267,16 @@ async def test_migration_unexpected_error_surfaces_instead_of_repair(
     # The migration runs during component setup, so the bug fails the
     # component and the hub is not loaded.
     assert hub_entry.state is ConfigEntryState.NOT_LOADED
-    # A bug is not an expected failure: no repair is created.
+    # A bug is not an expected failure: it is not turned into a repair.
     assert (
         issue_registry.async_get_issue(
             DOMAIN, f"migration_removal_failed_{legacy_entry.entry_id}"
+        )
+        is None
+    )
+    assert (
+        issue_registry.async_get_issue(
+            DOMAIN, f"migration_failed_{legacy_entry.entry_id}"
         )
         is None
     )

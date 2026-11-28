@@ -1,6 +1,7 @@
 """The OpenWrt (ubus) integration."""
 
 # pylint: disable=home-assistant-use-runtime-data  # The merging set is cross-entry state; entry.runtime_data is per-entry and is cleared by the hub reload a merge runs
+import contextlib
 import logging
 from types import MappingProxyType
 
@@ -14,7 +15,6 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import AbortFlow
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
     config_validation as cv,
     device_registry as dr,
@@ -323,14 +323,14 @@ async def _async_migrate_other(
     """Re-parent a legacy entry into subentries of the hub and remove it.
 
     An entry which cannot be unloaded is left in place, untouched, so its
-    router keeps polling on its own entry. Once its routers are tracked
-    on the hub, the entry is emptied before removal, so a failed removal
+    router keeps polling on its own entry; its repair points at fixing
+    the cause. The entry is emptied before removal, so a failed removal
     leaves a shell which cannot poll the same routers again and is
-    removed by the next migration; its repair points at deleting it. A
-    host collision only skips the colliding router; the remaining
-    routers are still transferred. The hub setup is never blocked by
-    one un-migratable entry. Expected core failures become repairs and
-    the migration continues; any other exception is a bug and
+    removed by the next migration. An entry the user removes while the
+    migration runs is gone by the time the removal does, so nothing is
+    left to repair. A host collision only skips the colliding router;
+    the remaining routers are still transferred. The hub setup is never
+    blocked by one un-migratable entry; any other exception is a bug and
     propagates, aborting the component setup without a repair.
 
     With holding_setup_lock the entry is being set up under the core-held
@@ -348,105 +348,82 @@ async def _async_migrate_other(
             if entry.subentries
             else entry.entry_id
         )
-    transferred = False
-    try:
-        if holding_setup_lock:
-            if hub.pref_disable_polling and not entry.pref_disable_polling:
-                hass.config_entries.async_update_entry(hub, pref_disable_polling=False)
-                for subentry in hub.subentries.values():
-                    _async_create_polling_enabled_issue(hass, hub, subentry)
+    if holding_setup_lock:
+        if hub.pref_disable_polling and not entry.pref_disable_polling:
+            hass.config_entries.async_update_entry(hub, pref_disable_polling=False)
+            for subentry in hub.subentries.values():
+                _async_create_polling_enabled_issue(hass, hub, subentry)
+        collision_hosts = _async_transfer_to_hub(hass, hub, entry)
+        # The hub already normalized its own tracker ids, before
+        # the merge moved this entry's over; reload it so the
+        # merged ids are normalized too, not left as duplicates.
+        # async_reload returns False instead of raising on a
+        # failed unload or setup. The reload takes the hub off
+        # the loaded state, so it is marked merging: a setup
+        # racing it waits on the hub's setup lock, held for the
+        # whole reload.
+        merging: set[str] = hass.data.setdefault(DOMAIN, set())
+        merging.add(hub.entry_id)
+        try:
+            if not await hass.config_entries.async_reload(hub.entry_id):
+                _async_create_hub_reload_failed_issue(hass, hub, entry, host)
+        finally:
+            merging.discard(hub.entry_id)
+        # The removal needs the setup lock, which is held for the
+        # rest of the setup, so it runs in a deferred task.
+        hass.async_create_task(_async_deferred_removal(hass, hub, entry, host))
+    else:
+        # Hold the entry's setup lock so it is never removed mid-setup and
+        # no setup can start while it is unloaded.
+        async with entry.setup_lock:
+            if (
+                not entry.state.recoverable
+                or not await hass.config_entries.async_unload(
+                    entry.entry_id, _lock=False
+                )
+            ):
+                _LOGGER.warning(
+                    "Could not unload ubus entry %s; leaving it in place "
+                    "instead of migrating it to the hub",
+                    entry.entry_id,
+                )
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    f"migration_failed_{entry.entry_id}",
+                    config_entry_id=entry.entry_id,
+                    is_fixable=False,
+                    issue_domain=DOMAIN,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="migration_failed",
+                    translation_placeholders={"host": host},
+                )
+                return False
             collision_hosts = _async_transfer_to_hub(hass, hub, entry)
-            transferred = True
-            # The hub already normalized its own tracker ids, before
-            # the merge moved this entry's over; reload it so the
-            # merged ids are normalized too, not left as duplicates.
-            # async_reload returns False instead of raising on a
-            # failed unload or setup. The reload takes the hub off
-            # the loaded state, so it is marked merging: a setup
-            # racing it waits on the hub's setup lock, held for the
-            # whole reload.
-            merging: set[str] = hass.data.setdefault(DOMAIN, set())
-            merging.add(hub.entry_id)
-            try:
-                if not await hass.config_entries.async_reload(hub.entry_id):
-                    _async_create_hub_reload_failed_issue(hass, hub, entry, host)
-            finally:
-                merging.discard(hub.entry_id)
-            # The removal needs the setup lock, which is held for the
-            # rest of the setup, so it runs in a deferred task.
-            hass.async_create_task(_async_deferred_removal(hass, hub, entry, host))
-        else:
-            # Hold the entry's setup lock so it is never removed mid-setup and
-            # no setup can start while it is unloaded.
-            async with entry.setup_lock:
-                if (
-                    not entry.state.recoverable
-                    or not await hass.config_entries.async_unload(
-                        entry.entry_id, _lock=False
-                    )
-                ):
-                    _LOGGER.warning(
-                        "Could not unload ubus entry %s; leaving it in place "
-                        "instead of migrating it to the hub",
-                        entry.entry_id,
-                    )
-                    ir.async_create_issue(
-                        hass,
-                        DOMAIN,
-                        f"migration_failed_{entry.entry_id}",
-                        config_entry_id=entry.entry_id,
-                        is_fixable=False,
-                        issue_domain=DOMAIN,
-                        severity=ir.IssueSeverity.ERROR,
-                        translation_key="migration_failed",
-                        translation_placeholders={"host": host},
-                    )
-                    return False
-                collision_hosts = _async_transfer_to_hub(hass, hub, entry)
-            transferred = True
-            # The entry was unloaded above, so the removal cannot leave live
-            # trackers behind.
+        # The entry was unloaded above, so the removal cannot leave live
+        # trackers behind. The user may have removed the entry in the
+        # meantime, so an UnknownEntry leaves nothing to repair.
+        with contextlib.suppress(UnknownEntry):
             await hass.config_entries.async_remove(entry.entry_id)
-        if collision_hosts:
-            _LOGGER.warning(
-                "Host %s already exists on the hub; removing the duplicate ubus entry",
-                ", ".join(collision_hosts),
-            )
-            # The duplicate entry is removed with the collision, so the
-            # issue is tied to the hub; it clears when the hub does.
-            ir.async_create_issue(
-                hass,
-                DOMAIN,
-                f"migration_host_collision_{entry.entry_id}",
-                config_entry_id=hub.entry_id,
-                is_fixable=False,
-                is_persistent=True,
-                issue_domain=DOMAIN,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key="migration_host_collision",
-                translation_placeholders={"host": ", ".join(collision_hosts)},
-            )
-    except HomeAssistantError:
-        _LOGGER.exception(
-            "Failed to migrate ubus entry %s to the hub %s",
-            entry.entry_id,
-            hub.entry_id,
+    if collision_hosts:
+        _LOGGER.warning(
+            "Host %s already exists on the hub; removing the duplicate ubus entry",
+            ", ".join(collision_hosts),
         )
-        if transferred:
-            _async_create_removal_failed_issue(hass, entry, host)
-        else:
-            ir.async_create_issue(
-                hass,
-                DOMAIN,
-                f"migration_failed_{entry.entry_id}",
-                config_entry_id=entry.entry_id,
-                is_fixable=False,
-                issue_domain=DOMAIN,
-                severity=ir.IssueSeverity.ERROR,
-                translation_key="migration_failed",
-                translation_placeholders={"host": host},
-            )
-        return False
+        # The duplicate entry is removed with the collision, so the
+        # issue is tied to the hub; it clears when the hub does.
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"migration_host_collision_{entry.entry_id}",
+            config_entry_id=hub.entry_id,
+            is_fixable=False,
+            is_persistent=True,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="migration_host_collision",
+            translation_placeholders={"host": ", ".join(collision_hosts)},
+        )
     return True
 
 
@@ -469,28 +446,6 @@ def _async_create_hub_reload_failed_issue(
         issue_domain=DOMAIN,
         severity=ir.IssueSeverity.ERROR,
         translation_key="migration_hub_reload_failed",
-        translation_placeholders={"host": host},
-    )
-
-
-@callback
-def _async_create_removal_failed_issue(
-    hass: HomeAssistant, entry: ConfigEntry, host: str
-) -> None:
-    """Create the repair for a merged entry which could not be removed.
-
-    The leftover entry is an empty shell now, so the repair can point
-    at deleting it.
-    """
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        f"migration_removal_failed_{entry.entry_id}",
-        config_entry_id=entry.entry_id,
-        is_fixable=False,
-        issue_domain=DOMAIN,
-        severity=ir.IssueSeverity.ERROR,
-        translation_key="migration_removal_failed",
         translation_placeholders={"host": host},
     )
 

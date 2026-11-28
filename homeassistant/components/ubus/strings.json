@@ -98,10 +98,6 @@
       "description": "The OpenWrt (ubus) entry for `{host}` had polling disabled, but the main entry polls every router on it, so `{host}` is polled now. Subentries cannot carry a polling setting; if the router should not be polled, delete the `{host}` subentry and remove the router's `device_tracker` YAML configuration, as the legacy scanner re-imports it on the next restart.",
       "title": "Router {host} is now polled"
     },
-    "migration_removal_failed": {
-      "description": "The OpenWrt (ubus) entry for `{host}` was moved to the main entry, but the old entry could not be deleted. It has been emptied, so it no longer polls the router; its client trackers are kept on the main entry. To complete the migration:\n\n1. Confirm the router is tracked on the main OpenWrt (ubus) entry.\n2. Delete the OpenWrt (ubus) entry for `{host}`.",
-      "title": "Failed to remove old entry for router {host}"
-    },
     "persistent_invalid_credentials": {
       "description": "The username and password for `{host}` are no longer valid, so the router cannot be queried. Use \"Change router\" on the `{host}` subentry to update the credentials.",
       "title": "Invalid credentials for {host}"
