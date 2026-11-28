@@ -4143,8 +4143,13 @@ async def test_migration_disabled_entry_collision_skips_warning(
         if issue.translation_key == "migration_disabled_entry"
     ]
     # The collision itself is still reported.
+    subentry = next(
+        subentry
+        for subentry in mock_config_entry.subentries.values()
+        if subentry.unique_id == MOCK_HOST
+    )
     issue = issue_registry.async_get_issue(
-        DOMAIN, f"migration_host_collision_{disabled_entry.entry_id}"
+        DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
     )
     assert issue is not None
     assert issue.translation_key == "migration_host_collision"
@@ -4495,15 +4500,18 @@ async def test_migration_host_collision(
     # The duplicate entry was removed; the hub keeps a single router.
     assert hass.config_entries.async_entries(DOMAIN) == [first]
     assert len(first.subentries) == 1
+    subentry = next(iter(first.subentries.values()))
     issue = issue_registry.async_get_issue(
-        DOMAIN, f"migration_host_collision_{duplicate.entry_id}"
+        DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
     )
     assert issue is not None
     assert issue.translation_key == "migration_host_collision"
-    # The collision is a one-time notice, not an error: it persists until
-    # the user dismisses it after checking the retained router.
+    # The collision is a one-time notice, not an error: it is shown in
+    # the session the migration ran and goes away after a restart, and
+    # deleting the subentry which keeps the router clears it sooner.
     assert issue.severity is ir.IssueSeverity.WARNING
-    assert issue.is_persistent
+    assert not issue.is_persistent
+    assert issue.config_subentry_id == subentry.subentry_id
     # The tracker was re-parented to the hub before the entry was removed.
     entity_id = entity_registry.async_get_entity_id(
         DEVICE_TRACKER_DOMAIN, DOMAIN, MAC_PHONE
@@ -4523,8 +4531,9 @@ async def test_migration_host_collision_issue_clears_with_hub(
     """Test the collision issue is cleared when the hub entry is removed.
 
     The duplicate entry is already gone when the issue is created, so
-    it is tied to the hub; removing the hub (e.g. by uninstalling the
-    integration) must clear it, not leave it behind.
+    it is tied to the hub and the subentry which keeps the router;
+    removing the hub (e.g. by uninstalling the integration) must clear
+    it, not leave it behind.
     """
     _mock, ubus = mock_ubus_by_host
     first = MockConfigEntry(
@@ -4547,8 +4556,9 @@ async def test_migration_host_collision_issue_clears_with_hub(
     assert await hass.config_entries.async_setup(first.entry_id)
     await hass.async_block_till_done()
 
+    subentry = next(iter(first.subentries.values()))
     issue = issue_registry.async_get_issue(
-        DOMAIN, f"migration_host_collision_{duplicate.entry_id}"
+        DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
     )
     assert issue is not None
     assert issue.config_entry_id == first.entry_id
@@ -4558,7 +4568,56 @@ async def test_migration_host_collision_issue_clears_with_hub(
     await hass.async_block_till_done()
     assert (
         issue_registry.async_get_issue(
-            DOMAIN, f"migration_host_collision_{duplicate.entry_id}"
+            DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
+        )
+        is None
+    )
+
+
+async def test_migration_host_collision_issue_clears_with_subentry(
+    hass: HomeAssistant,
+    mock_ubus_by_host: tuple[MagicMock, dict[str, MagicMock]],
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test deleting the kept router's subentry clears the collision issue.
+
+    The issue is the record that a duplicate entry was removed; once the
+    user deletes the subentry which keeps the router, the record has
+    nothing to point at and must clear with it.
+    """
+    _mock, ubus = mock_ubus_by_host
+    first = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        title=MOCK_HOST,
+        entry_id="00000000000000000000000000A",
+    )
+    duplicate = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG,
+        title=MOCK_HOST,
+        entry_id="00000000000000000000000000B",
+    )
+    duplicate.add_to_hass(hass)
+    ubus[MOCK_HOST].get_hostapd_clients.return_value = {
+        "clients": {MAC_PHONE: {"authorized": True}}
+    }
+    first.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(first.entry_id)
+    await hass.async_block_till_done()
+
+    subentry = next(iter(first.subentries.values()))
+    issue = issue_registry.async_get_issue(
+        DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
+    )
+    assert issue is not None
+
+    # Deleting the subentry which keeps the router clears the issue.
+    hass.config_entries.async_remove_subentry(first, subentry.subentry_id)
+    await hass.async_block_till_done()
+    assert (
+        issue_registry.async_get_issue(
+            DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
         )
         is None
     )
@@ -4659,8 +4718,13 @@ async def test_migration_host_collision_keeps_remaining_routers(
         MOCK_HOST_B,
         MOCK_HOST_C,
     }
+    subentry = next(
+        subentry
+        for subentry in hub_entry.subentries.values()
+        if subentry.unique_id == MOCK_HOST_B
+    )
     issue = issue_registry.async_get_issue(
-        DOMAIN, f"migration_host_collision_{legacy_entry.entry_id}"
+        DOMAIN, f"migration_host_collision_{subentry.subentry_id}"
     )
     assert issue is not None
     assert issue.translation_key == "migration_host_collision"

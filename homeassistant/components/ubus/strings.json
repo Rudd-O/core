@@ -87,7 +87,7 @@
       "title": "Failed to migrate router {host}"
     },
     "migration_host_collision": {
-      "description": "The OpenWrt (ubus) entry for `{host}` was removed because a router with the same host is already configured on the main entry. The router continues to be tracked through the existing subentry; check its settings to confirm they are the ones you want.",
+      "description": "The OpenWrt (ubus) entry for `{host}` was removed because the main entry already tracks a router with the same host, so the router continues to be tracked through the `{host}` subentry on the main entry, with its settings. To track the router with different settings, update that subentry; to stop tracking it, delete the subentry, which also clears this notice.",
       "title": "Duplicate router {host} was removed"
     },
     "migration_hub_reload_failed": {
